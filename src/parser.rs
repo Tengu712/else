@@ -1,8 +1,32 @@
+use regex::Regex;
+use std::sync::LazyLock;
+
+const INT_RE_RAW: &str = r"^[+-]?[0-9][0-9_]*$";
+const FLOAT_RE_RAW: &str = r"^[+-]?[0-9][0-9_]*\.[0-9][0-9_]*(e[+-]?[0-9][0-9_]*)?$";
+
+static INT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(INT_RE_RAW).unwrap());
+static FLOAT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(FLOAT_RE_RAW).unwrap());
+
 #[derive(Debug, PartialEq)]
 pub enum TokenValue {
     Sym(String),
+    Int(u128, bool),
+    Flt(f64),
     Str(String),
-    Num(String),
+}
+
+impl TokenValue {
+    fn from(s: &str, ln: usize, cn: usize) -> Result<Self, String> {
+        let err = |e: &str| format!("error: {s} is {e} as a number: {ln} line, {cn} char");
+        let res = if let Some((v, m)) = check_integer(s).map_err(err)? {
+            Self::Int(v, m)
+        } else if let Some(v) = check_float(s).map_err(err)? {
+            Self::Flt(v)
+        } else {
+            Self::Sym(s.to_string())
+        };
+        Ok(res)
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -62,17 +86,15 @@ impl Context {
         let mut closed = false;
 
         // skip left paren
-        self.cur += 1;
-        self.cn += 1;
+        self.advance();
 
         while self.cur < code.len() {
             match code[self.cur] {
                 '(' => asts.push(self.parse_list(code)?),
                 ')' => {
                     // skip right paren
-                    self.cur += 1;
-                    self.cn += 1;
                     closed = true;
+                    self.advance();
                     break;
                 }
                 ' ' | '\t' | '\r' | '\n' => self.skip_whitespaces(code),
@@ -104,25 +126,13 @@ impl Context {
             if matches!(code[self.cur], '(' | ')' | ' ' | '\t' | '\r' | '\n' | ';') {
                 break;
             }
-            self.cur += 1;
-            self.cn += 1;
+            self.advance();
         }
 
         let value = code[start_cur..self.cur].iter().collect::<String>();
-        let value = if value.parse::<u128>().is_ok() {
-            TokenValue::Num(value)
-        } else if check_integer(&value) {
-            return Err(format!(
-                "error: {value} is invalid as a number: {start_ln} line, {start_cn} char"
-            ));
-        } else if value.parse::<f64>().is_ok() {
-            TokenValue::Num(value)
-        } else {
-            TokenValue::Sym(value)
-        };
 
         Ok(Ast::Leaf(Token {
-            value,
+            value: TokenValue::from(&value, start_ln, start_cn)?,
             ln: start_ln,
             cn: start_cn,
         }))
@@ -136,8 +146,7 @@ impl Context {
         let mut buf = String::new();
 
         // skip left double-quote
-        self.cur += 1;
-        self.cn += 1;
+        self.advance();
 
         while self.cur < code.len() {
             match code[self.cur] {
@@ -146,46 +155,39 @@ impl Context {
                     self.break_line(code);
                 }
                 'n' if escaped => {
-                    buf.push('\n');
                     escaped = false;
-                    self.cur += 1;
-                    self.cn += 1;
+                    buf.push('\n');
+                    self.advance();
                 }
                 'r' if escaped => {
-                    buf.push('\r');
                     escaped = false;
-                    self.cur += 1;
-                    self.cn += 1;
+                    buf.push('\r');
+                    self.advance();
                 }
                 't' if escaped => {
-                    buf.push('\t');
                     escaped = false;
-                    self.cur += 1;
-                    self.cn += 1;
+                    buf.push('\t');
+                    self.advance();
                 }
                 '\\' if escaped => {
-                    buf.push('\\');
                     escaped = false;
-                    self.cur += 1;
-                    self.cn += 1;
+                    buf.push('\\');
+                    self.advance();
                 }
                 '0' if escaped => {
-                    buf.push('\0');
                     escaped = false;
-                    self.cur += 1;
-                    self.cn += 1;
+                    buf.push('\0');
+                    self.advance();
                 }
                 '\'' if escaped => {
-                    buf.push('\'');
                     escaped = false;
-                    self.cur += 1;
-                    self.cn += 1;
+                    buf.push('\'');
+                    self.advance();
                 }
                 '"' if escaped => {
-                    buf.push('"');
                     escaped = false;
-                    self.cur += 1;
-                    self.cn += 1;
+                    buf.push('"');
+                    self.advance();
                 }
                 // TODO: byte escape and unicode escape
                 c if escaped => {
@@ -195,17 +197,15 @@ impl Context {
                     ));
                 }
 
-                // skip right double-quote
                 '"' => {
-                    self.cur += 1;
-                    self.cn += 1;
+                    // skip right double-quote
                     closed = true;
+                    self.advance();
                     break;
                 }
                 '\\' => {
-                    self.cur += 1;
-                    self.cn += 1;
                     escaped = true;
+                    self.advance();
                 }
                 '\r' | '\n' => {
                     buf.push('\n');
@@ -213,8 +213,7 @@ impl Context {
                 }
                 c => {
                     buf.push(c);
-                    self.cur += 1;
-                    self.cn += 1;
+                    self.advance();
                 }
             }
         }
@@ -235,10 +234,7 @@ impl Context {
     fn skip_whitespaces(&mut self, code: &[char]) {
         while self.cur < code.len() {
             match code[self.cur] {
-                ' ' | '\t' => {
-                    self.cur += 1;
-                    self.cn += 1;
-                }
+                ' ' | '\t' => self.advance(),
                 '\r' | '\n' => self.break_line(code),
                 _ => break,
             }
@@ -251,7 +247,7 @@ impl Context {
                 self.break_line(code);
                 break;
             }
-            self.cur += 1;
+            self.advance();
         }
     }
 
@@ -276,16 +272,47 @@ impl Context {
             ),
         }
     }
+
+    fn advance(&mut self) {
+        self.cur += 1;
+        self.cn += 1;
+    }
 }
 
 pub fn parse(code: &str) -> Result<Vec<Ast>, String> {
     Context::default().parse_root(&code.chars().collect::<Vec<char>>())
 }
 
-fn check_integer(s: &str) -> bool {
-    let s = s.strip_prefix("-").unwrap_or(s);
-    s.chars()
-        .all(|c| matches!(c, '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9'))
+fn check_integer(s: &str) -> Result<Option<(u128, bool)>, &'static str> {
+    if !INT_RE.is_match(s) {
+        return Ok(None);
+    }
+
+    let s = s.replace('_', "");
+    if s.starts_with('-') {
+        s.parse::<i128>()
+            .map(|v| Some((v as u128, true)))
+            .map_err(|_| "too small")
+    } else {
+        s.parse::<u128>()
+            .map(|v| Some((v, false)))
+            .map_err(|_| "too big")
+    }
+}
+
+fn check_float(s: &str) -> Result<Option<f64>, &'static str> {
+    if !FLOAT_RE.is_match(s) {
+        return Ok(None);
+    }
+
+    let v = s
+        .replace('_', "")
+        .parse::<f64>()
+        .expect("unexpected error: failed to parse float");
+    if v.is_infinite() {
+        return Err(if v > 0.0 { "too big" } else { "too small" });
+    }
+    Ok(Some(v))
 }
 
 #[cfg(test)]
@@ -318,40 +345,47 @@ mod test {
 
     #[test]
     fn parse_lists() {
-        let input = "(1 23 (() ab \"foo bar\n \\n\\\"baz\" c 1.23) ()) ()";
+        let input = r#"(340282366920938463463374607431768211455 
+-170_141_183_460_469_231_731_687_303_715_884_105_728 (() ab "foo bar
+ \n\"baz" c 1.23 -1.1_e1_0_) ()) ()"#;
         let expected = vec![
             Ast::Edge(vec![
                 Ast::Leaf(Token {
-                    value: TokenValue::Num("1".to_string()),
+                    value: TokenValue::Int(340282366920938463463374607431768211455, false),
                     ln: 1,
                     cn: 2,
                 }),
                 Ast::Leaf(Token {
-                    value: TokenValue::Num("23".to_string()),
-                    ln: 1,
-                    cn: 4,
+                    value: TokenValue::Int(170141183460469231731687303715884105728, true),
+                    ln: 2,
+                    cn: 1,
                 }),
                 Ast::Edge(vec![
                     Ast::Edge(vec![]),
                     Ast::Leaf(Token {
                         value: TokenValue::Sym("ab".to_string()),
-                        ln: 1,
-                        cn: 11,
+                        ln: 2,
+                        cn: 58,
                     }),
                     Ast::Leaf(Token {
                         value: TokenValue::Str("foo bar\n \n\"baz".to_string()),
-                        ln: 1,
-                        cn: 14,
+                        ln: 2,
+                        cn: 61,
                     }),
                     Ast::Leaf(Token {
                         value: TokenValue::Sym("c".to_string()),
-                        ln: 2,
+                        ln: 3,
                         cn: 11,
                     }),
                     Ast::Leaf(Token {
-                        value: TokenValue::Num("1.23".to_string()),
-                        ln: 2,
+                        value: TokenValue::Flt(1.23),
+                        ln: 3,
                         cn: 13,
+                    }),
+                    Ast::Leaf(Token {
+                        value: TokenValue::Flt(-1.1e10),
+                        ln: 3,
+                        cn: 18,
                     }),
                 ]),
                 Ast::Edge(vec![]),
